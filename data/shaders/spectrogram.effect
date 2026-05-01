@@ -1,0 +1,35 @@
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+sampler_state linear_wrap {
+	Filter   = Linear;
+	AddressU = Wrap;   /* rolling circular-buffer display */
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSMain(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+float4 PSMain(VertData v_in) : TARGET
+{
+	return image.Sample(linear_wrap, v_in.uv);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSMain(v_in);
+		pixel_shader  = PSMain(v_in);
+	}
+}
