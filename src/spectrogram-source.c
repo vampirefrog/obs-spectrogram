@@ -6,7 +6,7 @@
 #include <util/bmem.h>
 #include <util/platform.h>
 
-#include <pthread.h>
+#include <util/threading.h>
 #include <math.h>
 #include <string.h>
 #include <stdio.h>

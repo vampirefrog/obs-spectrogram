@@ -44,15 +44,25 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-### Installing (Linux)
+### Linux
+
+Install the OBS development headers:
 
 ```bash
+sudo apt-get install libobs-dev   # Debian/Ubuntu
+```
+
+Then build and install:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 sudo cmake --install build
 ```
 
 This installs the plugin to `/usr/lib/obs-plugins/` and the shader to `/usr/share/obs/obs-plugins/obs-spectrogram/`.
 
-### Installing manually (Linux)
+#### Installing manually (Linux)
 
 ```bash
 mkdir -p ~/.config/obs-studio/plugins/obs-spectrogram/bin/64bit
@@ -63,6 +73,30 @@ cp build/obs-spectrogram.so \
 
 cp data/shaders/spectrogram.effect \
    ~/.config/obs-studio/plugins/obs-spectrogram/data/shaders/
+```
+
+### Windows (MSYS2 / MinGW-w64)
+
+Install [MSYS2](https://www.msys2.org/), then from an **MINGW64** shell:
+
+```bash
+pacman -S mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-obs-studio
+```
+
+Build:
+
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+Install to a local prefix and copy into your OBS plugin directory:
+
+```bash
+cmake --install build --prefix "$INSTALL_DIR"
+# then copy $INSTALL_DIR/obs-plugins/64bit/obs-spectrogram.dll
+# and  $INSTALL_DIR/data/obs-plugins/obs-spectrogram/
+# into %APPDATA%\obs-studio\plugins\obs-spectrogram\
 ```
 
 ## Usage
