@@ -86,10 +86,12 @@ jobs:
             -DCMAKE_PREFIX_PATH="${{ github.workspace }}/.deps/obs-deps" `
             -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/.deps"
 
-      - name: Build libobs
+      - name: Build libobs and obs-frontend-api
         if: steps.cache-obs.outputs.cache-hit != 'true'
         working-directory: ${{ github.workspace }}/.deps/obs-studio
-        run: cmake --build build_x64 --target libobs --config RelWithDebInfo --parallel
+        run: |
+          cmake --build build_x64 --target libobs --config RelWithDebInfo --parallel
+          cmake --build build_x64 --target obs-frontend-api --config RelWithDebInfo --parallel
 
       - name: Install libobs (Development component)
         if: steps.cache-obs.outputs.cache-hit != 'true'
