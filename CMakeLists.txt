@@ -15,9 +15,12 @@ add_library(obs-spectrogram MODULE
 target_link_libraries(obs-spectrogram
     PRIVATE
     OBS::libobs
-    m
-    pthread
 )
+
+if(UNIX AND NOT APPLE)
+    find_package(Threads REQUIRED)
+    target_link_libraries(obs-spectrogram PRIVATE Threads::Threads m)
+endif()
 
 target_include_directories(obs-spectrogram PRIVATE src)
 
@@ -25,10 +28,19 @@ set_target_properties(obs-spectrogram PROPERTIES PREFIX "")
 
 include(GNUInstallDirs)
 
+if(WIN32)
+    set(OBS_PLUGIN_DEST "obs-plugins/64bit")
+    set(OBS_DATA_DEST   "data/obs-plugins/obs-spectrogram")
+else()
+    set(OBS_PLUGIN_DEST "${CMAKE_INSTALL_LIBDIR}/obs-plugins")
+    set(OBS_DATA_DEST   "${CMAKE_INSTALL_DATAROOTDIR}/obs/obs-plugins/obs-spectrogram")
+endif()
+
 install(TARGETS obs-spectrogram
-    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/obs-plugins"
+    LIBRARY DESTINATION "${OBS_PLUGIN_DEST}"
+    RUNTIME DESTINATION "${OBS_PLUGIN_DEST}"
 )
 
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data/"
-    DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/obs/obs-plugins/obs-spectrogram"
+    DESTINATION "${OBS_DATA_DEST}"
 )
