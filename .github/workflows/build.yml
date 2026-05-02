@@ -7,6 +7,10 @@ on:
     branches: [master, main]
   workflow_dispatch:
 
+env:
+  OBS_VERSION: "31.1.1"
+  OBS_DEPS_VERSION: "2025-07-11"
+
 jobs:
   linux:
     name: Linux (x86_64)
@@ -17,39 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libobs-dev
-
-      - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: obs-spectrogram-linux
-          path: |
-            build/obs-spectrogram.so
-            data/
-
-  windows:
-    name: Windows (x86_64)
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-obs-studio
+          sudo apt-get install -y cmake ninja-build libobs-dev
 
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -57,10 +29,86 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      - name: Stage install
+        run: cmake --install build --prefix "${{ github.workspace }}/release"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: obs-spectrogram-windows
-          path: |
-            build/obs-spectrogram.dll
-            data/
+          name: obs-spectrogram-linux-x86_64
+          path: release/
+
+  windows:
+    name: Windows (x64)
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache OBS dependency tree
+        id: cache-obs
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.deps
+          key: obs-${{ env.OBS_VERSION }}-deps-${{ env.OBS_DEPS_VERSION }}-windows-x64-v3
+
+      - name: Download obs-deps (FFmpeg/x264/etc.)
+        if: steps.cache-obs.outputs.cache-hit != 'true'
+        run: |
+          $url = "https://github.com/obsproject/obs-deps/releases/download/${env:OBS_DEPS_VERSION}/windows-deps-${env:OBS_DEPS_VERSION}-x64.zip"
+          New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/.deps/obs-deps" | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile "${{ github.workspace }}/.deps/obs-deps.zip"
+          Expand-Archive -Path "${{ github.workspace }}/.deps/obs-deps.zip" -DestinationPath "${{ github.workspace }}/.deps/obs-deps" -Force
+          Remove-Item "${{ github.workspace }}/.deps/obs-deps.zip"
+
+      - name: Download obs-studio source
+        if: steps.cache-obs.outputs.cache-hit != 'true'
+        run: |
+          $url = "https://github.com/obsproject/obs-studio/archive/refs/tags/${env:OBS_VERSION}.zip"
+          Invoke-WebRequest -Uri $url -OutFile "${{ github.workspace }}/.deps/obs-source.zip"
+          Expand-Archive -Path "${{ github.workspace }}/.deps/obs-source.zip" -DestinationPath "${{ github.workspace }}/.deps" -Force
+          Remove-Item "${{ github.workspace }}/.deps/obs-source.zip"
+          Rename-Item "${{ github.workspace }}/.deps/obs-studio-${env:OBS_VERSION}" "${{ github.workspace }}/.deps/obs-studio"
+
+      - name: Configure libobs
+        if: steps.cache-obs.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}/.deps/obs-studio
+        run: |
+          cmake -S . -B build_x64 `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DOBS_CMAKE_VERSION:STRING=3.0.0 `
+            -DOBS_VERSION_OVERRIDE:STRING="${env:OBS_VERSION}" `
+            -DENABLE_PLUGINS:BOOL=OFF `
+            -DENABLE_FRONTEND:BOOL=OFF `
+            -DCMAKE_ENABLE_SCRIPTING:BOOL=OFF `
+            -DCMAKE_PREFIX_PATH="${{ github.workspace }}/.deps/obs-deps" `
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/.deps"
+
+      - name: Build libobs
+        if: steps.cache-obs.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}/.deps/obs-studio
+        run: cmake --build build_x64 --target libobs --config RelWithDebInfo --parallel
+
+      - name: Install libobs (Development component)
+        if: steps.cache-obs.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}/.deps/obs-studio
+        run: cmake --install build_x64 --component Development --config RelWithDebInfo --prefix "${{ github.workspace }}/.deps"
+
+      - name: Configure plugin
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_PREFIX_PATH="${{ github.workspace }}/.deps;${{ github.workspace }}/.deps/obs-deps"
+
+      - name: Build plugin
+        run: cmake --build build --config RelWithDebInfo --parallel
+
+      - name: Stage install
+        run: cmake --install build --prefix "${{ github.workspace }}/release" --config RelWithDebInfo
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: obs-spectrogram-windows-x64
+          path: release/
