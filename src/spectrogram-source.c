@@ -5,8 +5,10 @@
 #include <graphics/graphics.h>
 #include <util/bmem.h>
 #include <util/platform.h>
+#include <util/dstr.h>
 
 #include <util/threading.h>
+#include <media-io/audio-io.h>
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -15,6 +17,8 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+#define T(key) obs_module_text(key)
+
 /* ── limits ─────────────────────────────────────────────────────────────── */
 
 #define MAX_FFT_SIZE      8192
@@ -22,6 +26,14 @@
 #define MAX_PALETTE       16
 #define RING_SIZE         (MAX_FFT_SIZE * 8)
 #define MAX_RESONATE_BINS 1024
+
+/* Reserved audio-source setting value: capture the final output mix
+   (Track 1) instead of a single source. */
+#define OUTPUT_MIX_ID     "__output_mix__"
+#define OUTPUT_MIX_TRACK  0
+
+/* how often to retry finding an audio source that isn't there (yet) */
+#define RECONNECT_INTERVAL 1.0f
 
 /* ── analysis modes ──────────────────────────────────────────────────────── */
 
@@ -64,8 +76,15 @@
 
 struct spectrogram_source {
 	obs_source_t *source;
-	obs_source_t *audio_source;
-	char         *audio_source_name;
+
+	/* audio input: audio_ref is the setting value (source UUID, a legacy
+	   source name, or OUTPUT_MIX_ID); at most one of audio_weak /
+	   output_mix_connected is live at a time */
+	char              *audio_ref;
+	obs_weak_source_t *audio_weak;
+	volatile bool      audio_removed;  /* set by the source's "remove" signal */
+	bool               output_mix_connected;
+	float              reconnect_timer;
 
 	/* display */
 	uint32_t width;
@@ -105,6 +124,7 @@ struct spectrogram_source {
 	uint32_t ring_w;
 	uint32_t ring_n;
 	uint32_t sample_rate;
+	uint32_t channels;
 
 	/* FFT scratch (render thread only) */
 	float    fft_re[MAX_FFT_SIZE];
@@ -131,9 +151,8 @@ struct spectrogram_source {
 	float    res_rt_re   [MAX_RESONATE_BINS]; /* smoothed R̃: real         */
 	float    res_rt_im   [MAX_RESONATE_BINS]; /* smoothed R̃: imaginary    */
 
-	/* pending column – produced then consumed on render thread */
+	/* column produced by compute_column, consumed by write_column */
 	uint32_t col_pixels[MAX_HEIGHT];
-	bool     col_ready;
 
 	/* GPU texture */
 	gs_texture_t *tex;
@@ -212,6 +231,15 @@ static void init_resonators(struct spectrogram_source *ctx)
 	}
 }
 
+/* Clamp a fractional array index to [0, n-1], mapping NaN to 0, so it
+   can be split into an integer part and a fraction safely. */
+static inline float clamp_index(float i, uint32_t n)
+{
+	if (!(i > 0.0f))
+		return 0.0f;
+	return i < (float)(n - 1) ? i : (float)(n - 1);
+}
+
 static inline uint8_t lerp_u8(uint8_t a, uint8_t b, float t)
 {
 	float v = (float)a + t * ((float)b - (float)a);
@@ -239,20 +267,30 @@ static uint32_t palette_lookup(float db, float db_min, float db_max,
 
 /* ── audio callback (audio thread) ──────────────────────────────────────── */
 
-static void audio_capture_cb(void *param, obs_source_t *source,
-                              const struct audio_data *data, bool muted)
+/* Downmix all channels of a planar-float block to mono and append it to
+   the ring buffer.  Only the first ctx->channels planes are valid: the
+   output-mix path leaves the rest of data->data[] uninitialised. */
+static void push_audio_frames(struct spectrogram_source *ctx,
+                              const struct audio_data *data)
 {
-	(void)source;
-	struct spectrogram_source *ctx = param;
-	if (muted || !data->data[0])
+	const float *planes[MAX_AV_PLANES];
+	uint32_t     nch = 0;
+	for (uint32_t c = 0; c < ctx->channels; c++) {
+		if (data->data[c])
+			planes[nch++] = (const float *)data->data[c];
+	}
+	if (!nch)
 		return;
 
-	const float *in = (const float *)data->data[0];
-	uint32_t     nf = data->frames;
+	float    scale = 1.0f / (float)nch;
+	uint32_t nf    = data->frames;
 
 	pthread_mutex_lock(&ctx->mutex);
 	for (uint32_t i = 0; i < nf; i++) {
-		ctx->ring[ctx->ring_w] = in[i];
+		float x = 0.0f;
+		for (uint32_t c = 0; c < nch; c++)
+			x += planes[c][i];
+		ctx->ring[ctx->ring_w] = x * scale;
 		ctx->ring_w = (ctx->ring_w + 1) % RING_SIZE;
 		if (ctx->ring_n < RING_SIZE) {
 			ctx->ring_n++;
@@ -263,7 +301,22 @@ static void audio_capture_cb(void *param, obs_source_t *source,
 	pthread_mutex_unlock(&ctx->mutex);
 }
 
-/* ── FFT column (render thread) ──────────────────────────────────────────── */
+static void capture_source_audio(void *param, obs_source_t *source,
+                                 const struct audio_data *data, bool muted)
+{
+	(void)source;
+	if (!muted)
+		push_audio_frames(param, data);
+}
+
+static void capture_output_mix(void *param, size_t mix_idx,
+                               struct audio_data *data)
+{
+	(void)mix_idx;
+	push_audio_frames(param, data);
+}
+
+/* ── FFT column (graphics thread) ────────────────────────────────────────── */
 
 static bool compute_column_fft(struct spectrogram_source *ctx)
 {
@@ -309,25 +362,21 @@ static bool compute_column_fft(struct spectrogram_source *ctx)
 			? expf(log_lo + t * (log_hi - log_lo))
 			: f_min + t * (f_max - f_min);
 
-		float bin_f = freq * (float)ctx->fft_size / (float)ctx->sample_rate;
+		float bin_f = clamp_index(freq * (float)ctx->fft_size / (float)ctx->sample_rate,
+		                          num_bins);
 		int   b0    = (int)bin_f;
 		float frac  = bin_f - (float)b0;
-		int   b1    = b0 + 1;
-
-		if (b0 < 0)              b0 = 0;
-		if (b0 >= (int)num_bins) b0 = (int)num_bins - 1;
-		if (b1 >= (int)num_bins) b1 = (int)num_bins - 1;
+		int   b1    = b0 + 1 < (int)num_bins ? b0 + 1 : b0;
 
 		float db = ctx->fft_im[b0] + frac * (ctx->fft_im[b1] - ctx->fft_im[b0]);
 		ctx->col_pixels[y] = palette_lookup(db, ctx->db_min, ctx->db_max,
 		                                    ctx->palette, ctx->palette_count);
 	}
 
-	ctx->col_ready = true;
 	return true;
 }
 
-/* ── Resonate column (render thread) ─────────────────────────────────────── *
+/* ── Resonate column (graphics thread) ───────────────────────────────────── *
  *                                                                             *
  * Implements "Resonate: Efficient Low Latency Spectral Analysis of Audio     *
  * Signals" by Alexandre R. J. François, ICMC 2025.                           *
@@ -423,16 +472,13 @@ static bool compute_column_resonate(struct spectrogram_source *ctx)
 			: logf(disp_f0 + t * (disp_f1 - disp_f0));
 
 		/* fractional resonator index (resonators are log-spaced) */
-		float kf   = (span > 0.f)
+		float kf = (span > 0.f)
 			? (log_freq - lf0) / span * (float)(N - 1)
 			: 0.0f;
+		kf = clamp_index(kf, N);
 		int   k0   = (int)kf;
 		float frac = kf - (float)k0;
-		int   k1   = k0 + 1;
-
-		if (k0 < 0)       { k0 = 0;     frac = 0.f; }
-		if (k0 >= (int)N) { k0 = (int)N - 1; frac = 0.f; }
-		if (k1 >= (int)N)   k1 = (int)N - 1;
+		int   k1   = k0 + 1 < (int)N ? k0 + 1 : k0;
 
 		float re0, im0, re1, im1;
 		if (ctx->resonate_smooth) {
@@ -455,7 +501,6 @@ static bool compute_column_resonate(struct spectrogram_source *ctx)
 		                                    ctx->palette, ctx->palette_count);
 	}
 
-	ctx->col_ready = true;
 	return true;
 }
 
@@ -466,22 +511,23 @@ static bool compute_column(struct spectrogram_source *ctx)
 		: compute_column_fft(ctx);
 }
 
-/* ── texture update (render thread, inside graphics context) ────────────── */
+/* ── texture update (graphics thread) ────────────────────────────────────── */
 
-static void flush_column(struct spectrogram_source *ctx)
+static void write_column(struct spectrogram_source *ctx)
 {
-	if (!ctx->col_ready || !ctx->tex || !ctx->tex_cpu)
-		return;
-
 	uint32_t xc = ctx->write_col;
 	for (uint32_t y = 0; y < ctx->height; y++)
 		ctx->tex_cpu[y * ctx->width + xc] = ctx->col_pixels[y];
 
 	ctx->write_col = (xc + 1) % ctx->width;
-	ctx->col_ready = false;
+}
 
+static void upload_texture(struct spectrogram_source *ctx)
+{
 	uint8_t  *ptr;
 	uint32_t  ls;
+
+	obs_enter_graphics();
 	if (gs_texture_map(ctx->tex, &ptr, &ls)) {
 		for (uint32_t y = 0; y < ctx->height; y++)
 			memcpy(ptr + y * ls,
@@ -489,9 +535,158 @@ static void flush_column(struct spectrogram_source *ctx)
 			       ctx->width * 4);
 		gs_texture_unmap(ctx->tex);
 	}
+	obs_leave_graphics();
 }
 
-/* ── rendering (render thread) ───────────────────────────────────────────── */
+static void reset_ring(struct spectrogram_source *ctx)
+{
+	pthread_mutex_lock(&ctx->mutex);
+	ctx->ring_r = ctx->ring_w = ctx->ring_n = 0;
+	pthread_mutex_unlock(&ctx->mutex);
+}
+
+/* ── audio source connection ─────────────────────────────────────────────── */
+
+static bool is_output_mix(const char *ref)
+{
+	return ref && strcmp(ref, OUTPUT_MIX_ID) == 0;
+}
+
+/* Resolve the setting value to a source.  New settings store the UUID;
+   settings saved by older versions store the source name. */
+static obs_source_t *find_audio_source(const char *ref)
+{
+	obs_source_t *src = obs_get_source_by_uuid(ref);
+	return src ? src : obs_get_source_by_name(ref);
+}
+
+static bool is_audio_connected(const struct spectrogram_source *ctx)
+{
+	return ctx->audio_weak || ctx->output_mix_connected;
+}
+
+static void handle_audio_source_removed(void *param, calldata_t *cd)
+{
+	(void)cd;
+	struct spectrogram_source *ctx = param;
+	os_atomic_set_bool(&ctx->audio_removed, true);
+}
+
+static void disconnect_audio(struct spectrogram_source *ctx)
+{
+	if (ctx->output_mix_connected) {
+		audio_output_disconnect(obs_get_audio(), OUTPUT_MIX_TRACK,
+		                        capture_output_mix, ctx);
+		ctx->output_mix_connected = false;
+	}
+	if (ctx->audio_weak) {
+		obs_source_t *src = obs_weak_source_get_source(ctx->audio_weak);
+		if (src) {
+			obs_source_remove_audio_capture_callback(src,
+				capture_source_audio, ctx);
+			signal_handler_disconnect(obs_source_get_signal_handler(src),
+				"remove", handle_audio_source_removed, ctx);
+			obs_source_release(src);
+		}
+		obs_weak_source_release(ctx->audio_weak);
+		ctx->audio_weak = NULL;
+		os_atomic_set_bool(&ctx->audio_removed, false);
+	}
+}
+
+/* Rewrite a legacy name-based setting to the source's UUID, so renaming
+   the audio source later doesn't break the link. */
+static void migrate_audio_ref(struct spectrogram_source *ctx, obs_source_t *src)
+{
+	const char *uuid = obs_source_get_uuid(src);
+	if (!uuid || strcmp(uuid, ctx->audio_ref) == 0)
+		return;
+
+	obs_data_t *settings = obs_source_get_settings(ctx->source);
+	obs_data_set_string(settings, S_AUDIO_SRC, uuid);
+	obs_data_release(settings);
+
+	bfree(ctx->audio_ref);
+	ctx->audio_ref = bstrdup(uuid);
+}
+
+/* Try to connect to ctx->audio_ref.  Failing is normal: while a scene
+   collection loads, the audio source may not exist yet, so the tick
+   retries every RECONNECT_INTERVAL. */
+static void connect_audio(struct spectrogram_source *ctx)
+{
+	if (!ctx->audio_ref || !*ctx->audio_ref || is_audio_connected(ctx))
+		return;
+
+	if (is_output_mix(ctx->audio_ref)) {
+		ctx->output_mix_connected = audio_output_connect(obs_get_audio(),
+			OUTPUT_MIX_TRACK, NULL, capture_output_mix, ctx);
+		return;
+	}
+
+	obs_source_t *src = find_audio_source(ctx->audio_ref);
+	if (!src)
+		return;
+
+	if (src != ctx->source && !obs_source_removed(src)) {
+		migrate_audio_ref(ctx, src);
+		obs_source_add_audio_capture_callback(src, capture_source_audio, ctx);
+		signal_handler_connect(obs_source_get_signal_handler(src),
+			"remove", handle_audio_source_removed, ctx);
+		ctx->audio_weak = obs_source_get_weak_source(src);
+	}
+	obs_source_release(src);
+}
+
+/* Drop the connection if the audio source was deleted, and keep retrying
+   while the configured source is missing.  This runs every frame, so it
+   must not take a strong reference: holding one, even briefly, can stop
+   the audio source from being freed when OBS clears a scene collection. */
+static void check_audio_connection(struct spectrogram_source *ctx, float seconds)
+{
+	if (ctx->audio_weak && (os_atomic_load_bool(&ctx->audio_removed) ||
+	                        obs_weak_source_expired(ctx->audio_weak)))
+		disconnect_audio(ctx);
+
+	if (is_audio_connected(ctx))
+		return;
+
+	ctx->reconnect_timer -= seconds;
+	if (ctx->reconnect_timer <= 0.0f) {
+		ctx->reconnect_timer = RECONNECT_INTERVAL;
+		connect_audio(ctx);
+	}
+}
+
+/* ── tick (graphics thread) ──────────────────────────────────────────────── *
+ * Analysis runs here rather than in video_render: render is called once per *
+ * view (preview, program, projectors), tick exactly once per frame.         */
+
+static void spectrogram_tick(void *data, float seconds)
+{
+	struct spectrogram_source *ctx = data;
+
+	check_audio_connection(ctx, seconds);
+
+	if (!ctx->tex || !ctx->tex_cpu)
+		return;
+
+	/* nothing sees us: don't burn CPU, just discard the audio */
+	if (!obs_source_showing(ctx->source)) {
+		reset_ring(ctx);
+		return;
+	}
+
+	bool dirty = false;
+	for (uint32_t i = 0; i < ctx->width && compute_column(ctx); i++) {
+		write_column(ctx);
+		dirty = true;
+	}
+	if (dirty)
+		upload_texture(ctx);
+}
+
+/* ── rendering (graphics thread) ─────────────────────────────────────────── */
 
 static void draw_quad(float sx, float sy, float sw, float sh,
                       float u0, float v0, float u1, float v1)
@@ -517,12 +712,6 @@ static void spectrogram_render(void *data, gs_effect_t *unused_effect)
 	if (!ctx->tex || !ctx->effect)
 		return;
 
-	for (int i = 0; i < 8; i++) {
-		if (!compute_column(ctx))
-			break;
-		flush_column(ctx);
-	}
-
 	/* U starts at the write head (oldest column) and runs to write_head + 1.0.
 	   AddressU = Wrap in the shader makes the sampler roll over seamlessly,
 	   so screen pixel p maps to texture column (write_col + p) % width. */
@@ -534,38 +723,6 @@ static void spectrogram_render(void *data, gs_effect_t *unused_effect)
 		draw_quad(0.f, 0.f, (float)ctx->width, (float)ctx->height,
 		          u0, 0.f, u0 + 1.0f, 1.f);
 	}
-}
-
-/* ── audio source attachment ─────────────────────────────────────────────── */
-
-static void detach_audio(struct spectrogram_source *ctx)
-{
-	if (ctx->audio_source) {
-		obs_source_remove_audio_capture_callback(ctx->audio_source,
-		                                          audio_capture_cb, ctx);
-		obs_source_release(ctx->audio_source);
-		ctx->audio_source = NULL;
-	}
-	bfree(ctx->audio_source_name);
-	ctx->audio_source_name = NULL;
-}
-
-static void attach_audio(struct spectrogram_source *ctx, const char *name)
-{
-	detach_audio(ctx);
-	if (!name || !*name)
-		return;
-
-	ctx->audio_source_name = bstrdup(name);
-	ctx->audio_source      = obs_get_source_by_name(name);
-	if (!ctx->audio_source)
-		return;
-
-	obs_source_add_audio_capture_callback(ctx->audio_source,
-	                                       audio_capture_cb, ctx);
-
-	struct obs_audio_info ai;
-	ctx->sample_rate = obs_get_audio_info(&ai) ? ai.samples_per_sec : 48000;
 }
 
 /* ── texture (re)creation ────────────────────────────────────────────────── */
@@ -587,13 +744,55 @@ static void rebuild_texture(struct spectrogram_source *ctx)
 
 /* ── properties ──────────────────────────────────────────────────────────── */
 
-static bool enum_audio_cb(void *param, obs_source_t *src)
+struct audio_list_ctx {
+	obs_property_t *list;
+	obs_source_t   *self;
+};
+
+/* Offer the same sources the Audio Mixer would show.  OBS_SOURCE_AUDIO
+   is a static capability flag, so it's also set on webcams with audio
+   disabled, window/game captures not capturing audio, browser sources not
+   routing audio through OBS, etc.  Those clear obs_source_audio_active(). */
+static bool add_audio_source_to_list(void *param, obs_source_t *src)
 {
-	if (obs_source_get_output_flags(src) & OBS_SOURCE_AUDIO) {
-		const char *name = obs_source_get_name(src);
-		obs_property_list_add_string((obs_property_t *)param, name, name);
-	}
+	struct audio_list_ctx *d = param;
+
+	if (src == d->self)
+		return true;
+	if (!(obs_source_get_output_flags(src) & OBS_SOURCE_AUDIO))
+		return true;
+	if (!obs_source_audio_active(src))
+		return true;
+
+	obs_property_list_add_string(d->list, obs_source_get_name(src),
+	                             obs_source_get_uuid(src));
 	return true;
+}
+
+/* Keep the current selection in the list even if it's filtered out or
+   missing, so opening the properties doesn't silently change it. */
+static void add_current_audio_ref(obs_property_t *list, const char *ref)
+{
+	if (!ref || !*ref || is_output_mix(ref))
+		return;
+
+	size_t n = obs_property_list_item_count(list);
+	for (size_t i = 0; i < n; i++) {
+		if (strcmp(obs_property_list_item_string(list, i), ref) == 0)
+			return;
+	}
+
+	obs_source_t *src = find_audio_source(ref);
+	struct dstr label = {0};
+	if (src) {
+		dstr_printf(&label, "%s %s", obs_source_get_name(src),
+		            obs_module_text("AudioSource.Inactive"));
+		obs_source_release(src);
+	} else {
+		dstr_printf(&label, "%s", obs_module_text("AudioSource.Missing"));
+	}
+	obs_property_list_add_string(list, label.array, ref);
+	dstr_free(&label);
 }
 
 static bool analysis_mode_changed(obs_properties_t *props,
@@ -614,7 +813,6 @@ static bool analysis_mode_changed(obs_properties_t *props,
 	return true;
 }
 
-
 static obs_properties_t *spectrogram_get_properties(void *data)
 {
 	struct spectrogram_source *ctx = data;
@@ -622,23 +820,33 @@ static obs_properties_t *spectrogram_get_properties(void *data)
 
 	/* audio source */
 	obs_property_t *src_p = obs_properties_add_list(props, S_AUDIO_SRC,
-		"Audio Source", OBS_COMBO_TYPE_EDITABLE, OBS_COMBO_FORMAT_STRING);
-	obs_enum_sources(enum_audio_cb, src_p);
+		T("AudioSource"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_set_long_description(src_p, T("AudioSource.Description"));
+	obs_property_list_add_string(src_p, T("AudioSource.None"), "");
+	obs_property_list_add_string(src_p, T("AudioSource.OutputMix"),
+	                             OUTPUT_MIX_ID);
+	struct audio_list_ctx list_ctx = {
+		.list = src_p,
+		.self = ctx ? ctx->source : NULL,
+	};
+	obs_enum_sources(add_audio_source_to_list, &list_ctx);
+	if (ctx)
+		add_current_audio_ref(src_p, ctx->audio_ref);
 
 	/* display */
-	obs_properties_add_int(props, S_WIDTH,  "Width (px)",  64, 4096, 1);
-	obs_properties_add_int(props, S_HEIGHT, "Height (px)", 64, MAX_HEIGHT, 1);
+	obs_properties_add_int(props, S_WIDTH,  T("Width"),  64, 4096, 1);
+	obs_properties_add_int(props, S_HEIGHT, T("Height"), 64, MAX_HEIGHT, 1);
 
 	/* analysis mode */
 	obs_property_t *mode_p = obs_properties_add_list(props, S_ANALYSIS_MODE,
-		"Analysis Mode", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(mode_p, "FFT",     ANALYSIS_FFT);
-	obs_property_list_add_int(mode_p, "Resonate (François 2025)", ANALYSIS_RESONATE);
+		T("AnalysisMode"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(mode_p, T("AnalysisMode.FFT"),      ANALYSIS_FFT);
+	obs_property_list_add_int(mode_p, T("AnalysisMode.Resonate"), ANALYSIS_RESONATE);
 	obs_property_set_modified_callback(mode_p, analysis_mode_changed);
 
 	/* ── FFT options (hidden when Resonate is active) ─────────────────── */
 	obs_property_t *fft_p = obs_properties_add_list(props, S_FFT_SIZE,
-		"FFT Size", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+		T("FFTSize"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(fft_p, "256",  256);
 	obs_property_list_add_int(fft_p, "512",  512);
 	obs_property_list_add_int(fft_p, "1024", 1024);
@@ -647,22 +855,22 @@ static obs_properties_t *spectrogram_get_properties(void *data)
 	obs_property_list_add_int(fft_p, "8192", 8192);
 
 	obs_properties_add_float_slider(props, S_OVERLAP,
-		"Overlap", 0.0, 0.95, 0.05);
+		T("Overlap"), 0.0, 0.95, 0.05);
 
 	obs_property_t *win_p = obs_properties_add_list(props, S_WINDOW,
-		"Window Function", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(win_p, "Rectangular", WIN_RECT);
-	obs_property_list_add_int(win_p, "Hann",        WIN_HANN);
-	obs_property_list_add_int(win_p, "Hamming",     WIN_HAMMING);
-	obs_property_list_add_int(win_p, "Blackman",    WIN_BLACKMAN);
+		T("Window"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(win_p, T("Window.Rectangular"), WIN_RECT);
+	obs_property_list_add_int(win_p, T("Window.Hann"),        WIN_HANN);
+	obs_property_list_add_int(win_p, T("Window.Hamming"),     WIN_HAMMING);
+	obs_property_list_add_int(win_p, T("Window.Blackman"),    WIN_BLACKMAN);
 
 	/* ── Resonate options (hidden when FFT is active) ─────────────────── */
 	obs_property_t *bins_p = obs_properties_add_int_slider(props,
-		S_RESONATE_BINS, "Resonators", 2, MAX_RESONATE_BINS, 1);
+		S_RESONATE_BINS, T("Resonators"), 2, MAX_RESONATE_BINS, 1);
 	obs_property_set_visible(bins_p, false);
 
 	obs_property_t *hop_p = obs_properties_add_list(props, S_RESONATE_HOP,
-		"Column Hop (samples)", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+		T("ColumnHop"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(hop_p, "64",   64);
 	obs_property_list_add_int(hop_p, "128",  128);
 	obs_property_list_add_int(hop_p, "256",  256);
@@ -672,32 +880,33 @@ static obs_properties_t *spectrogram_get_properties(void *data)
 	obs_property_set_visible(hop_p, false);
 
 	obs_property_t *smooth_p = obs_properties_add_bool(props,
-		S_RESONATE_SMOOTH, "Double Smoothing (R̃, Eq. 8)");
+		S_RESONATE_SMOOTH, T("DoubleSmoothing"));
 	obs_property_set_visible(smooth_p, false);
 
 	/* ── common ───────────────────────────────────────────────────────── */
-	obs_properties_add_float(props, S_MIN_FREQ, "Min Frequency (Hz)",
+	obs_properties_add_float(props, S_MIN_FREQ, T("MinFrequency"),
 	                          1.0, 20000.0, 1.0);
-	obs_properties_add_float(props, S_MAX_FREQ, "Max Frequency (Hz)",
+	obs_properties_add_float(props, S_MAX_FREQ, T("MaxFrequency"),
 	                          100.0, 24000.0, 1.0);
-	obs_properties_add_float_slider(props, S_DB_MIN, "Floor (dB)",
+	obs_properties_add_float_slider(props, S_DB_MIN, T("FloorDb"),
 	                                 -120.0, 0.0, 1.0);
-	obs_properties_add_float_slider(props, S_DB_MAX, "Ceiling (dB)",
+	obs_properties_add_float_slider(props, S_DB_MAX, T("CeilingDb"),
 	                                 -120.0, 0.0, 1.0);
-	obs_properties_add_float_slider(props, S_GAIN, "Gain (dB)",
+	obs_properties_add_float_slider(props, S_GAIN, T("GainDb"),
 	                                 -40.0, 40.0, 0.5);
-	obs_properties_add_bool(props, S_LOG_SCALE, "Logarithmic Frequency Scale");
+	obs_properties_add_bool(props, S_LOG_SCALE, T("LogScale"));
 
 	/* palette – 3 fixed color stops: low power → mid → high power */
-	obs_properties_add_color_alpha(props, S_COLOR_0, "Color: Low Power");
-	obs_properties_add_color_alpha(props, S_COLOR_1, "Color: Mid Power");
-	obs_properties_add_color_alpha(props, S_COLOR_2, "Color: High Power");
+	obs_properties_add_color_alpha(props, S_COLOR_0, T("ColorLow"));
+	obs_properties_add_color_alpha(props, S_COLOR_1, T("ColorMid"));
+	obs_properties_add_color_alpha(props, S_COLOR_2, T("ColorHigh"));
 
 	return props;
 }
 
 static void spectrogram_get_defaults(obs_data_t *settings)
 {
+	obs_data_set_default_string(settings, S_AUDIO_SRC,      "");
 	obs_data_set_default_int   (settings, S_WIDTH,          800);
 	obs_data_set_default_int   (settings, S_HEIGHT,         300);
 	obs_data_set_default_int   (settings, S_ANALYSIS_MODE,  ANALYSIS_FFT);
@@ -769,6 +978,19 @@ static void spectrogram_update(void *data, obs_data_t *settings)
 	ctx->log_scale = obs_data_get_bool  (settings, S_LOG_SCALE);
 	ctx->min_freq  = (float)obs_data_get_double(settings, S_MIN_FREQ);
 	ctx->max_freq  = (float)obs_data_get_double(settings, S_MAX_FREQ);
+
+	/* the two fields are independent in the UI, so the range can arrive
+	   inverted or reaching past Nyquist */
+	float nyquist = (float)ctx->sample_rate * 0.5f;
+	if (ctx->min_freq > ctx->max_freq) {
+		float t = ctx->min_freq;
+		ctx->min_freq = ctx->max_freq;
+		ctx->max_freq = t;
+	}
+	if (ctx->max_freq > nyquist)       ctx->max_freq = nyquist;
+	if (ctx->min_freq < 1.0f)          ctx->min_freq = 1.0f;
+	if (ctx->min_freq >= ctx->max_freq) ctx->min_freq = ctx->max_freq * 0.5f;
+
 	ctx->db_min    = (float)obs_data_get_double(settings, S_DB_MIN);
 	ctx->db_max    = (float)obs_data_get_double(settings, S_DB_MAX);
 	ctx->gain_db   = (float)obs_data_get_double(settings, S_GAIN);
@@ -791,22 +1013,23 @@ static void spectrogram_update(void *data, obs_data_t *settings)
 		}
 	}
 
-	/* audio source (sets sample_rate) */
-	const char *src_name = obs_data_get_string(settings, S_AUDIO_SRC);
-	if (!ctx->audio_source_name ||
-	    strcmp(src_name, ctx->audio_source_name) != 0)
-		attach_audio(ctx, src_name);
+	/* audio source */
+	const char *ref = obs_data_get_string(settings, S_AUDIO_SRC);
+	if (!ctx->audio_ref || strcmp(ref, ctx->audio_ref) != 0) {
+		disconnect_audio(ctx);
+		bfree(ctx->audio_ref);
+		ctx->audio_ref = bstrdup(ref);
+		connect_audio(ctx);
+		ctx->reconnect_timer = RECONNECT_INTERVAL;
+	}
 
-	/* initialise resonators after sample_rate is known */
 	if (ctx->analysis_mode == ANALYSIS_RESONATE)
 		init_resonators(ctx);
 
 	if (rebuild)
 		rebuild_texture(ctx);
 
-	pthread_mutex_lock(&ctx->mutex);
-	ctx->ring_r = ctx->ring_w = ctx->ring_n = 0;
-	pthread_mutex_unlock(&ctx->mutex);
+	reset_ring(ctx);
 }
 
 /* ── lifecycle ───────────────────────────────────────────────────────────── */
@@ -816,6 +1039,17 @@ static void *spectrogram_create(obs_data_t *settings, obs_source_t *source)
 	struct spectrogram_source *ctx = bzalloc(sizeof(*ctx));
 	ctx->source = source;
 	pthread_mutex_init(&ctx->mutex, NULL);
+
+	struct obs_audio_info ai;
+	if (obs_get_audio_info(&ai)) {
+		ctx->sample_rate = ai.samples_per_sec;
+		ctx->channels    = get_audio_channels(ai.speakers);
+	} else {
+		ctx->sample_rate = 48000;
+		ctx->channels    = 2;
+	}
+	if (ctx->channels > MAX_AV_PLANES)
+		ctx->channels = MAX_AV_PLANES;
 
 	obs_enter_graphics();
 	char *path = obs_module_file("shaders/spectrogram.effect");
@@ -832,7 +1066,8 @@ static void *spectrogram_create(obs_data_t *settings, obs_source_t *source)
 static void spectrogram_destroy(void *data)
 {
 	struct spectrogram_source *ctx = data;
-	detach_audio(ctx);
+	disconnect_audio(ctx);
+	bfree(ctx->audio_ref);
 
 	obs_enter_graphics();
 	if (ctx->tex)    gs_texture_destroy(ctx->tex);
@@ -855,7 +1090,7 @@ static uint32_t spectrogram_get_height(void *data)
 static const char *spectrogram_get_name(void *unused)
 {
 	(void)unused;
-	return "Spectrogram";
+	return T("Spectrogram");
 }
 
 /* ── registration ────────────────────────────────────────────────────────── */
@@ -864,10 +1099,12 @@ struct obs_source_info spectrogram_source_info = {
 	.id             = "spectrogram_source",
 	.type           = OBS_SOURCE_TYPE_INPUT,
 	.output_flags   = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW,
+	.icon_type      = OBS_ICON_TYPE_AUDIO_OUTPUT,
 	.get_name       = spectrogram_get_name,
 	.create         = spectrogram_create,
 	.destroy        = spectrogram_destroy,
 	.update         = spectrogram_update,
+	.video_tick     = spectrogram_tick,
 	.video_render   = spectrogram_render,
 	.get_properties = spectrogram_get_properties,
 	.get_defaults   = spectrogram_get_defaults,
