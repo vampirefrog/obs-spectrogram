@@ -15,7 +15,7 @@ env:
 jobs:
   linux:
     name: Linux (x86_64)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -30,8 +30,14 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
-      - name: Stage install
-        run: cmake --install build --prefix "${{ github.workspace }}/release"
+      # Per-user plugin layout: extracts into ~/.config/obs-studio/plugins/
+      # (or the Flatpak equivalent) without root, on any distro.
+      - name: Stage plugin
+        run: |
+          dest=release/obs-spectrogram
+          mkdir -p "$dest/bin/64bit" "$dest/data"
+          cp build/obs-spectrogram.so "$dest/bin/64bit/"
+          cp -r data/. "$dest/data/"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
