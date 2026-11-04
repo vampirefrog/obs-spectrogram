@@ -23,6 +23,7 @@ if(UNIX AND NOT APPLE)
 endif()
 
 target_include_directories(obs-spectrogram PRIVATE src)
+target_compile_definitions(obs-spectrogram PRIVATE PLUGIN_VERSION="${PROJECT_VERSION}")
 
 set_target_properties(obs-spectrogram PROPERTIES PREFIX "")
 
