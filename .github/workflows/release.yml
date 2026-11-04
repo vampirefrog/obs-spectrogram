@@ -9,7 +9,23 @@ permissions:
   contents: write
 
 jobs:
+  check-version:
+    name: Check tag matches project version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare tag with CMakeLists.txt
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          project=$(sed -n 's/^project(obs-spectrogram VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          if [ "${tag%%-*}" != "$project" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match project version $project in CMakeLists.txt"
+            exit 1
+          fi
+
   build:
+    needs: check-version
     uses: ./.github/workflows/build.yml
 
   release:
