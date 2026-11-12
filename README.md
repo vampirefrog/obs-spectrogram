@@ -171,4 +171,4 @@ The Resonate algorithm is described in Alexandre R. J. François, *"Resonate: Ef
 
 ## AI disclosure
 
-The design of this plugin, and the choice of the Resonate algorithm, are mine. The implementation was written with [Claude](https://claude.ai) (Anthropic), working from that design: the analysis and rendering code, audio source handling, the soak test, the CI workflows and this README.
+The design of this plugin, the rolling texture mechanism, and the choice of the Resonate algorithm, are mine. The implementation was written with [Claude](https://claude.ai) (Anthropic), working from that design: the analysis and rendering code, audio source handling, the soak test, the CI workflows and this README.
