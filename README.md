@@ -154,12 +154,20 @@ Analysis runs once per frame in `video_tick`, not in `video_render`, which OBS c
 
 The Resonate algorithm maintains a bank of *N* independent complex resonators, each updated once per input sample:
 
-```
-P ← P · e^{−iω_k·Δt}          (rotate phasor)
-R ← (1 − α_k)·R + α_k · x · P  (EWMA of demodulated signal)
+```math
+\begin{aligned}
+P_k &\leftarrow P_k \, e^{-i \omega_k \Delta t} && \text{(rotate phasor)} \\
+R_k &\leftarrow (1 - \alpha_k) \, R_k + \alpha_k \, x \, P_k && \text{(EWMA of demodulated signal)}
+\end{aligned}
 ```
 
-where `α_k = 1 − e^{−Δt · f_k / log(1 + f_k)}` gives each resonator a time constant proportional to its period. Resonators are geometrically spaced between the configured frequency bounds. The magnitude `|R|` is read every *hop* input samples to produce one display column.
+where $x$ is the input sample, $\omega_k = 2 \pi f_k$, $\Delta t$ is the sample period and
+
+```math
+\alpha_k = 1 - e^{-\Delta t \, f_k / \log(1 + f_k)}
+```
+
+gives each resonator a time constant proportional to its period. Resonators are geometrically spaced between the configured frequency bounds. The magnitude $\lvert R_k \rvert$ is read every *hop* input samples to produce one display column.
 
 Unlike FFT, Resonate needs no frame buffering: every sample updates the whole bank, so a column reflects the signal right up to its last sample.
 
